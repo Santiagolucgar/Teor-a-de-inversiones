@@ -33,6 +33,37 @@ Or using the requirements file:
 pip install -r requirements.txt
 ```
 
+## Installation
+
+It is highly recommended to use a virtual environment to avoid conflicts with global libraries and ensure `pip` works correctly.
+
+1. Open your terminal (PowerShell or Git Bash) in the project folder.
+2. Create a virtual environment by running:
+   ```bash
+   python -m venv venv
+   ```
+   *(If `python` doesn't work, try `py -m venv venv` or `python3 -m venv venv`)*
+
+3. Activate the virtual environment:
+   - **In PowerShell (Windows):**
+     ```powershell
+     .\venv\Scripts\Activate.ps1
+     ```
+     *(Note: If you get an execution policy error, run this first as administrator: `Set-ExecutionPolicy Unrestricted -Scope CurrentUser`, then try activating again).*
+   - **In Git Bash / Git CMD (Windows):**
+     ```bash
+     source venv/Scripts/activate
+     ```
+   - **In macOS / Linux:**
+     ```bash
+     source venv/bin/activate
+     ```
+
+4. Once your environment is active (you will see `(venv)` at the start of your command line), install the dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
 ## Quick Start
 
 ```bash
