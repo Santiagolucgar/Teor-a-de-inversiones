@@ -112,25 +112,29 @@ def get_user_inputs():
 
     # ── Tickers ──────────────────────────────────────────────────────────────
     print("\n[1/6]  STOCK TICKERS")
-    print(f"  Enter up to {MAX_TICKERS} tickers separated by spaces or commas.")
-    print("  Examples: AAPL MSFT KO WMT SPY\n")
-
+    
     while True:
-        raw = input("  Tickers: ").strip()
-        if not raw:
-            print("  ✗ You must enter at least 1 ticker.")
-            continue
-        # Accept both spaces and commas as separators
-        tickers = [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
-        tickers = list(dict.fromkeys(tickers))   # remove duplicates while keeping order
+        try:
+            num_tickers = int(input(f"  How many tickers do you want to analyze? (Max {MAX_TICKERS}): ").strip())
+            if 1 <= num_tickers <= MAX_TICKERS:
+                break
+            else:
+                print(f"  ✗ Please enter a number between 1 and {MAX_TICKERS}.")
+        except ValueError:
+            print("  ✗ Invalid number. Please enter an integer.")
 
-        if len(tickers) > MAX_TICKERS:
-            print(f"  ✗ Too many tickers. Maximum is {MAX_TICKERS}. You entered {len(tickers)}.")
-            continue
-        if len(tickers) < 1:
-            print("  ✗ Please enter at least 1 ticker.")
-            continue
-        break
+    tickers = []
+    print("\n  Enter the ticker symbols one by one (e.g., AAPL, MSFT, SPY):")
+    for i in range(num_tickers):
+        while True:
+            ticker = input(f"    Ticker {i+1}/{num_tickers}: ").strip().upper()
+            if not ticker:
+                print("  ✗ Ticker cannot be empty.")
+            elif ticker in tickers:
+                print("  ✗ Ticker already added. Please enter a different one.")
+            else:
+                tickers.append(ticker)
+                break
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
     print(f"\n[2/6]  BENCHMARK")
