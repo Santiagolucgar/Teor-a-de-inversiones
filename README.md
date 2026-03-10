@@ -21,12 +21,34 @@ Ensure you have Python 3 installed. The required libraries are listed in `requir
 
 ## Installation
 
-1. Clone or download this project.
-2. Install the necessary dependencies by running:
+Es altamente recomendable usar un entorno virtual (virtual environment) para evitar problemas con librerías globales y asegurar que `pip` funcione correctamente.
 
-```bash
-pip install -r requirements.txt
-```
+1. Abre tu terminal (PowerShell o Git Bash) en la carpeta del proyecto.
+2. Crea un entorno virtual ejecutando:
+   ```bash
+   python -m venv venv
+   ```
+   *(Si `python` no funciona, intenta usar `py -m venv venv` o `python3 -m venv venv`)*
+
+3. Activa el entorno virtual:
+   - **En PowerShell (Windows):**
+     ```powershell
+     .\venv\Scripts\Activate.ps1
+     ```
+     *(Nota: Si te da un error de permisos de ejecución, corre este comando primero como administrador: `Set-ExecutionPolicy Unrestricted -Scope CurrentUser`, luego intenta activar de nuevo).*
+   - **En Git Bash / Git CMD (Windows):**
+     ```bash
+     source venv/Scripts/activate
+     ```
+   - **En macOS / Linux:**
+     ```bash
+     source venv/bin/activate
+     ```
+
+4. Una vez que tu entorno esté activado (verás un `(venv)` al inicio de tu línea de comandos), instala las dependencias:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 ## Usage
 
