@@ -1,69 +1,77 @@
-# Markowitz Portfolio Optimizer
+# Investment Allocation & Decision-Support Tool
 
-A Python script that optimizes an investment portfolio based on Modern Portfolio Theory (Markowitz), using historical data directly from Yahoo Finance.
+A comprehensive Python CLI tool for portfolio optimization and investment advisory.
+Built on Markowitz mean-variance theory with investor profiling, fixed-income recommendations, VaR analysis, valuation signals, and professional recommendation reports.
 
 ## Features
 
-- **Automated Data Retrieval:** Fetches historical adjusted close prices for selected stocks and a benchmark from Yahoo Finance.
-- **Investor Profiling:** Automatically determines your investor profile (Conservative, Moderate, Aggressive) based on your desired proportion of variable versus fixed income.
-- **Markowitz Optimization:** Uses `scipy.optimize` to find two key portfolios:
-  - **Maximum Sharpe Ratio Portfolio:** The portfolio with the highest expected return per unit of risk.
-  - **Minimum Variance Portfolio:** The portfolio with the lowest overall volatility.
-- **Monte Carlo Simulation:** Simulates thousands of random portfolios to generate the Efficient Frontier.
-- **Visual Dashboard:** Generates a 4-panel chart (`portfolio_analysis_charts.png`) containing:
-  - Normalized price history of the selected assets and benchmark.
-  - Risk-Return scatter plot representing the Efficient Frontier.
-  - Pie chart representing the optimal asset allocation weights (Maximum Sharpe).
+| Module | Description |
+|--------|-------------|
+| **Investor Questionnaire** | 10-question structured survey → 5 risk profiles |
+| **Horizon Classification** | Short / Medium / Long term → influences all decisions |
+| **Fixed-Income Diversification** | Rule-based allocation across 7 debt instrument categories |
+| **Markowitz Optimization** | Max Sharpe + Min Variance portfolios (long-only) |
+| **Monte Carlo Simulation** | 5,000 random portfolios for efficient frontier |
+| **Value-at-Risk (VaR)** | Parametric VaR at 90%, 95%, 99% confidence |
+| **Target Return Mode** | Check if portfolio meets user-defined return goals |
+| **Valuation Signals** | P/E, P/B, 52-week range → under/overvalued classification |
+| **Rebalancing Engine** | Drift, volatility, valuation-based suggestions |
+| **Benchmark Comparison** | Return, volatility, Sharpe, max drawdown, cumulative return |
+| **Professional Report** | Advisory memo with 8 structured sections |
+| **CSV Exports** | Correlation, covariance, stats, weights, FI recommendation |
+| **Dashboard Charts** | Normalized prices, efficient frontier, pie charts, heatmap |
 
 ## Requirements
 
-Ensure you have Python 3 installed. The required libraries are listed in `requirements.txt`.
+```
+pip install yfinance pandas numpy matplotlib scipy seaborn
+```
 
-## Installation
+Or using the requirements file:
 
-Es altamente recomendable usar un entorno virtual (virtual environment) para evitar problemas con librerías globales y asegurar que `pip` funcione correctamente.
+```
+pip install -r requirements.txt
+```
 
-1. Abre tu terminal (PowerShell o Git Bash) en la carpeta del proyecto.
-2. Crea un entorno virtual ejecutando:
-   ```bash
-   python -m venv venv
-   ```
-   *(Si `python` no funciona, intenta usar `py -m venv venv` o `python3 -m venv venv`)*
-
-3. Activa el entorno virtual:
-   - **En PowerShell (Windows):**
-     ```powershell
-     .\venv\Scripts\Activate.ps1
-     ```
-     *(Nota: Si te da un error de permisos de ejecución, corre este comando primero como administrador: `Set-ExecutionPolicy Unrestricted -Scope CurrentUser`, luego intenta activar de nuevo).*
-   - **En Git Bash / Git CMD (Windows):**
-     ```bash
-     source venv/Scripts/activate
-     ```
-   - **En macOS / Linux:**
-     ```bash
-     source venv/bin/activate
-     ```
-
-4. Una vez que tu entorno esté activado (verás un `(venv)` al inicio de tu línea de comandos), instala las dependencias:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-
-Run the script from your terminal or command prompt:
+## Quick Start
 
 ```bash
 python portafolio_optimizer.py
 ```
 
-The script will interactively guide you through the following setup:
-1. **Stock Tickers**: E.g., `AAPL MSFT KO WMT SPY`
-2. **Benchmark**: E.g., `SPY` (default)
-3. **Data Periodicity**: `daily`, `weekly`, or `monthly`
-4. **Investment Horizon**: `6 months`, `1 year`, `3 years`, or `5 years`
-5. **Asset Allocation**: The percentage of Fixed vs. Variable income you wish to hold.
-6. **Risk-Free Rate**: The baseline annual interest rate (e.g., `4.5%`).
+The program will guide you through:
+1. **Investor questionnaire** — 10 questions about your objectives, horizon, and risk tolerance
+2. **Profile result** — computed risk profile with option to override
+3. **Asset allocation** — recommended FI/RV split based on profile + horizon
+4. **Fixed-income diversification** — optional recommendation for debt instruments
+5. **Market configuration** — tickers, benchmark, dates, periodicity, amount
+6. **Analysis** — optimization, VaR, valuation, rebalancing
+7. **Results** — full dashboard, professional recommendation memo, CSV exports
 
-Upon completion, an analysis snapshot will be printed in the console, and a dashboard image (`portfolio_analysis_charts.png`) will be saved in the directory where the script was run.
+## Investor Profiles
+
+| Profile | Equity Range | Optimization | Max Volatility |
+|---------|-------------|--------------|----------------|
+| Conservador | 10-30% | Min Variance | 12% |
+| Moderadamente Conservador | 20-40% | Min Variance | 16% |
+| Moderado | 30-60% | Max Sharpe | 20% |
+| Moderadamente Agresivo | 50-75% | Max Sharpe | 28% |
+| Agresivo | 70-95% | Max Sharpe | 35% |
+
+## Model Assumptions
+
+- Long-only portfolios (no short selling)
+- No leverage, derivatives, or margin
+- Parametric VaR assumes normal distribution
+- Valuation signals are indicative, not definitive
+- Fixed-income recommendations are rule-based (qualitative)
+
+## Output Files
+
+All outputs are saved in the `outputs/` directory:
+- `correlation_matrix.csv`
+- `covariance_matrix.csv`
+- `summary_statistics.csv`
+- `portfolio_weights.csv`
+- `fixed_income_recommendation.csv` (if FI module activated)
+- `portfolio_analysis_charts.png` (in project root)
