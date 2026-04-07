@@ -23,6 +23,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 import sys
 import os
+import json
 import warnings
 import numpy as np
 import pandas as pd
@@ -63,6 +64,7 @@ except ImportError:
 # SECTION 2 — CONFIGURATION (edit defaults here)
 # ─────────────────────────────────────────────────────────────────────────────
 
+SCRIPT_VERSION = "4.0.0"
 RISK_FREE_RATE = 0.045
 N_SIMULATIONS = 5000
 MAX_TICKERS = 100
@@ -235,6 +237,888 @@ STRESS_SCENARIOS = {
         "description": "Crecimiento bajo + inflacion alta. Proteccion limitada en bonos.",
     },
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2C — ECONOMIC CYCLE & SECTOR ROTATION CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Este modulo agrega logica de ciclo economico y rotacion sectorial.
+# Permite construir un universo de activos "top-down":
+#   1. Analizar la fase del ciclo economico
+#   2. Identificar sectores favorecidos en esa fase
+#   3. Seleccionar acciones candidatas en esos sectores
+#   4. Optimizar el portafolio (Markowitz — paso existente)
+#
+# TODAS las reglas son configurables via diccionarios.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Mapping: cycle phase → favored / secondary / underweight sectors
+# Based on classic sector rotation frameworks (e.g., Fidelity, S&P)
+# Sectors use GICS-style Spanish names matching STOCKS_CATALOG below.
+CYCLE_SECTOR_RULES = {
+    "recuperacion": {
+        "preferred_sectors": ["Financiero", "Consumo Discrecional", "Industriales"],
+        "secondary_sectors": ["Tecnologia", "Materiales"],
+        "underweight_or_avoid": ["Servicios Publicos", "Consumo Basico"],
+        "description": (
+            "La economia sale de una recesion. Los bancos se benefician de la "
+            "expansion crediticia, el consumo discrecional repunta y la "
+            "actividad industrial se reactiva."
+        ),
+    },
+    "expansion": {
+        "preferred_sectors": ["Tecnologia", "Industriales", "Materiales"],
+        "secondary_sectors": ["Consumo Discrecional", "Financiero", "Comunicaciones"],
+        "underweight_or_avoid": ["Servicios Publicos", "Consumo Basico"],
+        "description": (
+            "Crecimiento economico solido. La tecnologia lidera la innovacion, "
+            "la industria opera a alta capacidad y los materiales se benefician "
+            "de la demanda industrial."
+        ),
+    },
+    "desaceleracion": {
+        "preferred_sectors": ["Energia", "Consumo Basico", "Salud"],
+        "secondary_sectors": ["Servicios Publicos", "Financiero"],
+        "underweight_or_avoid": ["Tecnologia", "Consumo Discrecional", "Materiales"],
+        "description": (
+            "El crecimiento se desacelera. Los sectores defensivos (consumo basico, "
+            "salud) mantienen su demanda. La energia puede beneficiarse de presiones "
+            "inflacionarias tardias."
+        ),
+    },
+    "recesion": {
+        "preferred_sectors": ["Salud", "Servicios Publicos", "Consumo Basico"],
+        "secondary_sectors": ["Comunicaciones", "Energia"],
+        "underweight_or_avoid": ["Tecnologia", "Industriales", "Materiales", "Consumo Discrecional", "Financiero"],
+        "description": (
+            "Contraccion economica. Los sectores defensivos (salud, servicios publicos, "
+            "consumo basico) ofrecen estabilidad relativa. Los ciclicos sufren las "
+            "mayores caidas."
+        ),
+    },
+}
+
+# Cross-reference: profile aggressiveness × cycle phase → adjustment rules
+# Each entry modifies the base CYCLE_SECTOR_RULES preferences.
+# Keys: (profile_group, cycle_phase)
+# profile_group: "conservative" (Conservador, Mod. Conservador),
+#                "moderate"     (Moderado),
+#                "aggressive"   (Mod. Agresivo, Agresivo)
+PROFILE_CYCLE_ADJUSTMENTS = {
+    # ── Conservative profiles ─────────────────────────────────────────────
+    ("conservative", "recuperacion"): {
+        "adjustment": "Exposicion ciclica limitada; mas calidad y dividendos",
+        "add_to_preferred": ["Salud"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 30,  # at least 30% defensive sectors
+        "style_preference": ["defensive", "dividend"],
+    },
+    ("conservative", "expansion"): {
+        "adjustment": "Participar en crecimiento con sesgo defensivo",
+        "add_to_preferred": ["Salud", "Consumo Basico"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 25,
+        "style_preference": ["defensive", "value", "dividend"],
+    },
+    ("conservative", "desaceleracion"): {
+        "adjustment": "Enfoque completamente defensivo",
+        "add_to_preferred": ["Servicios Publicos"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 50,
+        "style_preference": ["defensive", "dividend"],
+    },
+    ("conservative", "recesion"): {
+        "adjustment": "Maxima proteccion; solo sectores defensivos de alta calidad",
+        "add_to_preferred": [],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 60,
+        "style_preference": ["defensive", "dividend"],
+    },
+    # ── Moderate profiles ─────────────────────────────────────────────────
+    ("moderate", "recuperacion"): {
+        "adjustment": "Equilibrio entre ciclicos de recuperacion y defensivos",
+        "add_to_preferred": ["Salud"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 20,
+        "style_preference": ["value", "growth"],
+    },
+    ("moderate", "expansion"): {
+        "adjustment": "Plena participacion en sectores de crecimiento",
+        "add_to_preferred": [],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 15,
+        "style_preference": ["growth", "value"],
+    },
+    ("moderate", "desaceleracion"): {
+        "adjustment": "Rotar gradualmente hacia defensivos manteniendo algo de ciclicos",
+        "add_to_preferred": ["Servicios Publicos"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 35,
+        "style_preference": ["defensive", "value"],
+    },
+    ("moderate", "recesion"): {
+        "adjustment": "Sesgo defensivo fuerte con algo de recuperacion anticipada",
+        "add_to_preferred": ["Financiero"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 40,
+        "style_preference": ["defensive", "value"],
+    },
+    # ── Aggressive profiles ───────────────────────────────────────────────
+    ("aggressive", "recuperacion"): {
+        "adjustment": "Maxima exposicion ciclica para capturar la recuperacion",
+        "add_to_preferred": ["Tecnologia"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 5,
+        "style_preference": ["growth", "cyclical"],
+    },
+    ("aggressive", "expansion"): {
+        "adjustment": "Maximo crecimiento; sectores de innovacion y beta alto",
+        "add_to_preferred": ["Consumo Discrecional"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 5,
+        "style_preference": ["growth", "cyclical"],
+    },
+    ("aggressive", "desaceleracion"): {
+        "adjustment": "Reducir ciclicos pero mantener posiciones de crecimiento selectas",
+        "add_to_preferred": ["Salud"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 15,
+        "style_preference": ["growth", "value"],
+    },
+    ("aggressive", "recesion"): {
+        "adjustment": "Posicionamiento contrarian: prepararse para la recuperacion",
+        "add_to_preferred": ["Financiero", "Consumo Discrecional"],
+        "remove_from_preferred": [],
+        "force_defensive_min_pct": 20,
+        "style_preference": ["value", "cyclical"],
+    },
+}
+
+# ── Stock catalog ────────────────────────────────────────────────────────
+# Catalogo ESTRATEGICO de acciones para el modo guiado.
+# Cada entrada tiene: ticker, name, sector, style, country
+# Styles: "defensive", "growth", "value", "cyclical", "dividend"
+# Este catalogo NO reemplaza datos de mercado reales; es un helper
+# para construir un universo candidato coherente.
+STOCKS_CATALOG = [
+    # ── Tecnologia ────────────────────────────────────────────────────────
+    {"ticker": "AAPL",  "name": "Apple",              "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "MSFT",  "name": "Microsoft",           "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "GOOGL", "name": "Alphabet (Google)",    "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "NVDA",  "name": "NVIDIA",              "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "META",  "name": "Meta Platforms",       "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "AVGO",  "name": "Broadcom",            "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    {"ticker": "CRM",   "name": "Salesforce",          "sector": "Tecnologia",           "style": "growth",    "country": "US"},
+    # ── Financiero ────────────────────────────────────────────────────────
+    {"ticker": "JPM",   "name": "JPMorgan Chase",      "sector": "Financiero",           "style": "value",     "country": "US"},
+    {"ticker": "BAC",   "name": "Bank of America",     "sector": "Financiero",           "style": "value",     "country": "US"},
+    {"ticker": "GS",    "name": "Goldman Sachs",       "sector": "Financiero",           "style": "cyclical",  "country": "US"},
+    {"ticker": "V",     "name": "Visa",                "sector": "Financiero",           "style": "growth",    "country": "US"},
+    {"ticker": "BRK-B", "name": "Berkshire Hathaway",  "sector": "Financiero",           "style": "value",     "country": "US"},
+    # ── Consumo Basico (Defensivo) ────────────────────────────────────────
+    {"ticker": "KO",    "name": "Coca-Cola",           "sector": "Consumo Basico",       "style": "defensive", "country": "US"},
+    {"ticker": "PG",    "name": "Procter & Gamble",    "sector": "Consumo Basico",       "style": "defensive", "country": "US"},
+    {"ticker": "WMT",   "name": "Walmart",             "sector": "Consumo Basico",       "style": "defensive", "country": "US"},
+    {"ticker": "COST",  "name": "Costco",              "sector": "Consumo Basico",       "style": "defensive", "country": "US"},
+    {"ticker": "PEP",   "name": "PepsiCo",             "sector": "Consumo Basico",       "style": "dividend",  "country": "US"},
+    # ── Consumo Discrecional (Ciclico) ────────────────────────────────────
+    {"ticker": "AMZN",  "name": "Amazon",              "sector": "Consumo Discrecional", "style": "growth",    "country": "US"},
+    {"ticker": "TSLA",  "name": "Tesla",               "sector": "Consumo Discrecional", "style": "growth",    "country": "US"},
+    {"ticker": "NKE",   "name": "Nike",                "sector": "Consumo Discrecional", "style": "cyclical",  "country": "US"},
+    {"ticker": "MCD",   "name": "McDonald's",          "sector": "Consumo Discrecional", "style": "dividend",  "country": "US"},
+    {"ticker": "HD",    "name": "Home Depot",          "sector": "Consumo Discrecional", "style": "cyclical",  "country": "US"},
+    # ── Salud (Defensivo) ─────────────────────────────────────────────────
+    {"ticker": "JNJ",   "name": "Johnson & Johnson",   "sector": "Salud",                "style": "defensive", "country": "US"},
+    {"ticker": "UNH",   "name": "UnitedHealth",        "sector": "Salud",                "style": "defensive", "country": "US"},
+    {"ticker": "PFE",   "name": "Pfizer",              "sector": "Salud",                "style": "value",     "country": "US"},
+    {"ticker": "ABT",   "name": "Abbott Labs",         "sector": "Salud",                "style": "defensive", "country": "US"},
+    {"ticker": "LLY",   "name": "Eli Lilly",           "sector": "Salud",                "style": "growth",    "country": "US"},
+    # ── Energia ───────────────────────────────────────────────────────────
+    {"ticker": "XOM",   "name": "Exxon Mobil",         "sector": "Energia",              "style": "value",     "country": "US"},
+    {"ticker": "CVX",   "name": "Chevron",             "sector": "Energia",              "style": "value",     "country": "US"},
+    {"ticker": "COP",   "name": "ConocoPhillips",      "sector": "Energia",              "style": "cyclical",  "country": "US"},
+    # ── Industriales ──────────────────────────────────────────────────────
+    {"ticker": "CAT",   "name": "Caterpillar",         "sector": "Industriales",         "style": "cyclical",  "country": "US"},
+    {"ticker": "HON",   "name": "Honeywell",           "sector": "Industriales",         "style": "value",     "country": "US"},
+    {"ticker": "UNP",   "name": "Union Pacific",       "sector": "Industriales",         "style": "value",     "country": "US"},
+    {"ticker": "MMM",   "name": "3M",                  "sector": "Industriales",         "style": "value",     "country": "US"},
+    {"ticker": "GE",    "name": "GE Aerospace",        "sector": "Industriales",         "style": "cyclical",  "country": "US"},
+    {"ticker": "DE",    "name": "Deere & Company",     "sector": "Industriales",         "style": "cyclical",  "country": "US"},
+    # ── Comunicaciones ────────────────────────────────────────────────────
+    {"ticker": "DIS",   "name": "Walt Disney",         "sector": "Comunicaciones",       "style": "cyclical",  "country": "US"},
+    {"ticker": "NFLX",  "name": "Netflix",             "sector": "Comunicaciones",       "style": "growth",    "country": "US"},
+    {"ticker": "CMCSA", "name": "Comcast",             "sector": "Comunicaciones",       "style": "value",     "country": "US"},
+    {"ticker": "TMUS",  "name": "T-Mobile US",         "sector": "Comunicaciones",       "style": "growth",    "country": "US"},
+    # ── Materiales ────────────────────────────────────────────────────────
+    {"ticker": "LIN",   "name": "Linde",               "sector": "Materiales",           "style": "value",     "country": "US"},
+    {"ticker": "FCX",   "name": "Freeport-McMoRan",    "sector": "Materiales",           "style": "cyclical",  "country": "US"},
+    {"ticker": "NEM",   "name": "Newmont Mining",      "sector": "Materiales",           "style": "cyclical",  "country": "US"},
+    {"ticker": "APD",   "name": "Air Products",        "sector": "Materiales",           "style": "defensive", "country": "US"},
+    # ── Servicios Publicos (Defensivo) ────────────────────────────────────
+    {"ticker": "NEE",   "name": "NextEra Energy",      "sector": "Servicios Publicos",   "style": "defensive", "country": "US"},
+    {"ticker": "DUK",   "name": "Duke Energy",         "sector": "Servicios Publicos",   "style": "dividend",  "country": "US"},
+    {"ticker": "SO",    "name": "Southern Company",    "sector": "Servicios Publicos",   "style": "dividend",  "country": "US"},
+    {"ticker": "AEP",   "name": "American Electric",   "sector": "Servicios Publicos",   "style": "dividend",  "country": "US"},
+]
+
+# Thresholds for sector diversification warnings
+SECTOR_DIVERSIFICATION_RULES = {
+    "min_sectors": 3,             # minimum number of sectors represented
+    "max_single_sector_pct": 40,  # max % of assets from one sector (by count)
+    "ideal_min_sectors": 5,       # ideal minimum for "well diversified"
+    "preferred_max_sector_pct": 30,  # preferred max for any single sector
+}
+
+# Map profile names to the 3 profile groups used by PROFILE_CYCLE_ADJUSTMENTS
+PROFILE_TO_CYCLE_GROUP = {
+    "Conservador":              "conservative",
+    "Moderadamente Conservador": "conservative",
+    "Moderado":                 "moderate",
+    "Moderadamente Agresivo":   "aggressive",
+    "Agresivo":                 "aggressive",
+}
+
+# Defensive sectors used to enforce minimum defensive exposure
+DEFENSIVE_SECTORS = ["Salud", "Servicios Publicos", "Consumo Basico"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2D — ECONOMIC CYCLE & SECTOR ROTATION FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# Funciones que implementan la logica de ciclo economico y rotacion sectorial.
+# Estas funciones se usan en el modo guiado (guided portfolio builder).
+# NO modifican la logica de optimizacion existente.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_economic_cycle_phase():
+    """
+    [NEW — CYCLE MODULE]
+    Solicita al usuario que seleccione la fase del ciclo economico actual.
+    Retorna una de: 'recuperacion', 'expansion', 'desaceleracion', 'recesion'.
+
+    NOTA: Esta es una seleccion manual basada en el criterio del usuario.
+    En versiones futuras se podria inferir automaticamente con datos macro.
+    """
+    SEP = "=" * 65
+    print(f"\n{SEP}")
+    print("  MODULO DE CICLO ECONOMICO Y ROTACION SECTORIAL")
+    print(SEP)
+    print("""
+  La seleccion de activos puede mejorarse considerando la fase
+  del ciclo economico. Diferentes sectores tienden a desempenarse
+  mejor en diferentes fases del ciclo.
+
+  En que fase del ciclo economico crees que estamos?
+
+    1. Recuperacion   — La economia sale de una recesion.
+                        Crecimiento incipiente, tasas bajas.
+    2. Expansion      — Crecimiento economico solido.
+                        Empleo alto, confianza del consumidor.
+    3. Desaceleracion — El crecimiento se desacelera.
+                        Inflacion persistente, tasas altas.
+    4. Recesion       — Contraccion economica.
+                        Caida de empleo y produccion.
+""")
+    phase_map = {1: "recuperacion", 2: "expansion",
+                 3: "desaceleracion", 4: "recesion"}
+    choice = prompt_int("  Tu seleccion (1-4): ", 1, 4)
+    phase = phase_map[choice]
+
+    # Show description
+    desc = CYCLE_SECTOR_RULES[phase]["description"]
+    print(f"\n  Fase seleccionada: {phase.upper()}")
+    print(f"  {desc}")
+
+    return phase
+
+
+def get_cycle_sector_preferences(cycle_phase):
+    """
+    [NEW — CYCLE MODULE]
+    Dado una fase del ciclo economico, retorna las preferencias sectoriales
+    basadas en las reglas configuradas en CYCLE_SECTOR_RULES.
+
+    Retorna un dict con:
+      - preferred_sectors: list[str]    (sectores favorecidos)
+      - secondary_sectors: list[str]    (sectores secundarios)
+      - underweight_or_avoid: list[str] (sectores a subponderar)
+      - description: str               (explicacion de la fase)
+    """
+    if cycle_phase not in CYCLE_SECTOR_RULES:
+        raise ValueError(f"Fase de ciclo invalida: {cycle_phase}. "
+                         f"Opciones: {list(CYCLE_SECTOR_RULES.keys())}")
+
+    rules = CYCLE_SECTOR_RULES[cycle_phase]
+    return {
+        "preferred_sectors": list(rules["preferred_sectors"]),
+        "secondary_sectors": list(rules["secondary_sectors"]),
+        "underweight_or_avoid": list(rules["underweight_or_avoid"]),
+        "description": rules["description"],
+    }
+
+
+def adjust_sector_preferences_by_profile(profile, cycle_preferences, cycle_phase):
+    """
+    [NEW — CYCLE MODULE]
+    Ajusta las preferencias sectoriales del ciclo segun el perfil del inversionista.
+
+    Un inversionista conservador en recuperacion tendra menos exposicion ciclica
+    que uno agresivo. Un agresivo en recesion podria tomar posiciones contrarian.
+
+    Parametros:
+      - profile: str (nombre del perfil, ej. "Moderado")
+      - cycle_preferences: dict (output de get_cycle_sector_preferences)
+      - cycle_phase: str (ej. "expansion")
+
+    Retorna un dict con:
+      - adjusted_preferred: list[str]   (sectores preferidos ajustados)
+      - adjusted_secondary: list[str]   (sectores secundarios ajustados)
+      - underweight_or_avoid: list[str] (sectores a evitar)
+      - adjustment_description: str     (explicacion del ajuste)
+      - force_defensive_min_pct: int    (% minimo de sectores defensivos)
+      - style_preference: list[str]     (estilos de accion preferidos)
+      - profile_group: str              (conservative/moderate/aggressive)
+    """
+    profile_group = PROFILE_TO_CYCLE_GROUP.get(profile, "moderate")
+    key = (profile_group, cycle_phase)
+
+    # Get adjustment rules (default to moderate if key not found)
+    adjustment = PROFILE_CYCLE_ADJUSTMENTS.get(
+        key,
+        PROFILE_CYCLE_ADJUSTMENTS.get(("moderate", cycle_phase), {})
+    )
+
+    # Start with base cycle preferences
+    adjusted_preferred = list(cycle_preferences["preferred_sectors"])
+    adjusted_secondary = list(cycle_preferences["secondary_sectors"])
+
+    # Apply additions
+    for sector in adjustment.get("add_to_preferred", []):
+        if sector not in adjusted_preferred:
+            adjusted_preferred.append(sector)
+            # Remove from secondary if it was there
+            if sector in adjusted_secondary:
+                adjusted_secondary.remove(sector)
+
+    # Apply removals
+    for sector in adjustment.get("remove_from_preferred", []):
+        if sector in adjusted_preferred:
+            adjusted_preferred.remove(sector)
+            if sector not in adjusted_secondary:
+                adjusted_secondary.append(sector)
+
+    return {
+        "adjusted_preferred": adjusted_preferred,
+        "adjusted_secondary": adjusted_secondary,
+        "underweight_or_avoid": list(cycle_preferences["underweight_or_avoid"]),
+        "adjustment_description": adjustment.get("adjustment", "Sin ajuste especifico"),
+        "force_defensive_min_pct": adjustment.get("force_defensive_min_pct", 15),
+        "style_preference": adjustment.get("style_preference", ["growth", "value"]),
+        "profile_group": profile_group,
+    }
+
+
+def generate_candidate_universe(profile, cycle_phase, adjusted_prefs,
+                                stocks_catalog=None, n_assets=16):
+    """
+    [NEW — CYCLE MODULE]
+    Genera un universo candidato de activos diversificado basado en:
+      - Perfil del inversionista
+      - Fase del ciclo economico
+      - Preferencias sectoriales ajustadas
+      - Catalogo de acciones
+
+    Logica de distribucion (por conteo de activos):
+      - ~50-60% de sectores preferidos
+      - ~20-25% de sectores secundarios
+      - ~15-20% de sectores defensivos (ancla de proteccion)
+      - Respeta force_defensive_min_pct del ajuste por perfil
+
+    Retorna un dict con:
+      - tickers: list[str]
+      - ticker_details: list[dict]  (detalles de cada ticker seleccionado)
+      - sector_breakdown: dict      (sector → list of tickers)
+      - n_sectors: int
+      - strategy_label: str
+    """
+    if stocks_catalog is None:
+        stocks_catalog = STOCKS_CATALOG
+
+    preferred = adjusted_prefs["adjusted_preferred"]
+    secondary = adjusted_prefs["adjusted_secondary"]
+    underweight = adjusted_prefs["underweight_or_avoid"]
+    style_pref = adjusted_prefs.get("style_preference", ["growth", "value"])
+    defensive_min_pct = adjusted_prefs.get("force_defensive_min_pct", 15)
+
+    # Classify stocks by their tier (preferred, secondary, defensive, other)
+    preferred_stocks = [s for s in stocks_catalog if s["sector"] in preferred]
+    secondary_stocks = [s for s in stocks_catalog if s["sector"] in secondary]
+    defensive_stocks = [s for s in stocks_catalog
+                        if s["sector"] in DEFENSIVE_SECTORS
+                        and s["sector"] not in preferred
+                        and s["sector"] not in secondary]
+
+    # Sort each tier: prioritize preferred styles, then alphabetical
+    def _style_sort_key(stock):
+        """Sort stocks by style preference (lower = better match)."""
+        style = stock.get("style", "")
+        if style in style_pref:
+            return style_pref.index(style)
+        return len(style_pref)  # non-preferred styles sort last
+
+    preferred_stocks.sort(key=_style_sort_key)
+    secondary_stocks.sort(key=_style_sort_key)
+    defensive_stocks.sort(key=_style_sort_key)
+
+    # Calculate allocation targets
+    n_preferred = max(1, int(n_assets * 0.55))
+    n_defensive_min = max(1, int(n_assets * defensive_min_pct / 100))
+    n_secondary = max(1, n_assets - n_preferred - n_defensive_min)
+
+    # Adjust if we don't have enough stocks in a tier
+    if len(preferred_stocks) < n_preferred:
+        excess = n_preferred - len(preferred_stocks)
+        n_preferred = len(preferred_stocks)
+        n_secondary += excess
+    if len(secondary_stocks) < n_secondary:
+        excess = n_secondary - len(secondary_stocks)
+        n_secondary = len(secondary_stocks)
+        n_defensive_min += excess
+    if len(defensive_stocks) < n_defensive_min:
+        n_defensive_min = len(defensive_stocks)
+
+    # Select from each tier with sector diversification
+    def _select_diversified(stocks, n, max_per_sector=None):
+        """Select n stocks, limiting concentration per sector."""
+        if max_per_sector is None:
+            max_per_sector = max(2, n // 2)
+        selected = []
+        sector_counts = {}
+        for stock in stocks:
+            sector = stock["sector"]
+            if sector_counts.get(sector, 0) >= max_per_sector:
+                continue
+            # Avoid duplicate tickers
+            if stock["ticker"] in [s["ticker"] for s in selected]:
+                continue
+            selected.append(stock)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            if len(selected) >= n:
+                break
+        return selected
+
+    # Build the universe
+    selected_preferred = _select_diversified(preferred_stocks, n_preferred)
+    # Avoid tickers already selected
+    used_tickers = {s["ticker"] for s in selected_preferred}
+    remaining_secondary = [s for s in secondary_stocks if s["ticker"] not in used_tickers]
+    selected_secondary = _select_diversified(remaining_secondary, n_secondary)
+    used_tickers.update(s["ticker"] for s in selected_secondary)
+    remaining_defensive = [s for s in defensive_stocks if s["ticker"] not in used_tickers]
+    selected_defensive = _select_diversified(remaining_defensive, n_defensive_min)
+
+    # Combine all selections
+    all_selected = selected_preferred + selected_secondary + selected_defensive
+
+    # If we still have room, fill from underweight sectors (minimal)
+    if len(all_selected) < n_assets:
+        remaining = n_assets - len(all_selected)
+        used_tickers = {s["ticker"] for s in all_selected}
+        underweight_stocks = [s for s in stocks_catalog
+                              if s["ticker"] not in used_tickers]
+        # Prefer from non-underweight sectors first
+        underweight_stocks.sort(key=lambda s: (
+            1 if s["sector"] in underweight else 0,
+            _style_sort_key(s)
+        ))
+        fill = _select_diversified(underweight_stocks, remaining)
+        all_selected.extend(fill)
+
+    # Build sector breakdown
+    sector_breakdown = {}
+    for stock in all_selected:
+        sector = stock["sector"]
+        if sector not in sector_breakdown:
+            sector_breakdown[sector] = []
+        sector_breakdown[sector].append(stock["ticker"])
+
+    tickers = [s["ticker"] for s in all_selected]
+    n_sectors = len(sector_breakdown)
+
+    # Strategy label
+    phase_labels = {
+        "recuperacion": "Recuperacion",
+        "expansion": "Expansion",
+        "desaceleracion": "Desaceleracion",
+        "recesion": "Recesion",
+    }
+    strategy_label = (
+        f"Top-down: {phase_labels.get(cycle_phase, cycle_phase)} + "
+        f"perfil {profile}"
+    )
+
+    return {
+        "tickers": tickers,
+        "ticker_details": all_selected,
+        "sector_breakdown": sector_breakdown,
+        "n_sectors": n_sectors,
+        "strategy_label": strategy_label,
+    }
+
+
+def analyze_sector_diversification(tickers, stocks_catalog=None):
+    """
+    [NEW — CYCLE MODULE]
+    Analiza la diversificacion sectorial de un conjunto de tickers.
+
+    Verifica:
+      - Numero de sectores representados
+      - Concentracion por sector (conteo y porcentaje)
+      - Genera warnings si la concentracion es excesiva
+
+    Retorna un dict con:
+      - n_sectors: int
+      - sector_distribution: dict {sector: {"count": int, "pct": float, "tickers": list}}
+      - max_sector: dict {"sector": str, "count": int, "pct": float}
+      - warnings: list[str]
+      - alignment_score: str ("Alta", "Media", "Baja")
+    """
+    if stocks_catalog is None:
+        stocks_catalog = STOCKS_CATALOG
+
+    # Build a lookup: ticker → sector
+    ticker_to_sector = {s["ticker"]: s["sector"] for s in stocks_catalog}
+
+    sector_counts = {}
+    unknown_tickers = []
+    for t in tickers:
+        sector = ticker_to_sector.get(t)
+        if sector:
+            if sector not in sector_counts:
+                sector_counts[sector] = {"count": 0, "tickers": []}
+            sector_counts[sector]["count"] += 1
+            sector_counts[sector]["tickers"].append(t)
+        else:
+            unknown_tickers.append(t)
+
+    n_total = len(tickers)
+    n_sectors = len(sector_counts)
+    rules = SECTOR_DIVERSIFICATION_RULES
+
+    # Calculate percentages
+    sector_distribution = {}
+    max_sector = {"sector": "N/A", "count": 0, "pct": 0.0}
+    for sector, data in sector_counts.items():
+        pct = (data["count"] / n_total * 100) if n_total > 0 else 0
+        sector_distribution[sector] = {
+            "count": data["count"],
+            "pct": round(pct, 1),
+            "tickers": data["tickers"],
+        }
+        if data["count"] > max_sector["count"]:
+            max_sector = {"sector": sector, "count": data["count"], "pct": round(pct, 1)}
+
+    # Generate warnings
+    warnings = []
+
+    if n_sectors < rules["min_sectors"]:
+        warnings.append(
+            f"Solo {n_sectors} sector(es) representado(s). "
+            f"Se recomiendan al menos {rules['min_sectors']}."
+        )
+    elif n_sectors < rules["ideal_min_sectors"]:
+        warnings.append(
+            f"{n_sectors} sectores representados. Para mejor diversificacion, "
+            f"considera al menos {rules['ideal_min_sectors']}."
+        )
+
+    if max_sector["pct"] > rules["max_single_sector_pct"]:
+        warnings.append(
+            f"El sector {max_sector['sector']} concentra {max_sector['pct']:.0f}% "
+            f"de los activos (maximo sugerido: {rules['max_single_sector_pct']}%)."
+        )
+    elif max_sector["pct"] > rules["preferred_max_sector_pct"]:
+        warnings.append(
+            f"El sector {max_sector['sector']} tiene {max_sector['pct']:.0f}% "
+            f"de los activos. Considera reducir a menos de {rules['preferred_max_sector_pct']}%."
+        )
+
+    if unknown_tickers:
+        warnings.append(
+            f"Tickers no clasificados sectorialmente: {', '.join(unknown_tickers)}. "
+            f"El analisis sectorial puede estar incompleto."
+        )
+
+    # Alignment score
+    if n_sectors >= rules["ideal_min_sectors"] and max_sector["pct"] <= rules["preferred_max_sector_pct"]:
+        alignment_score = "Alta"
+    elif n_sectors >= rules["min_sectors"] and max_sector["pct"] <= rules["max_single_sector_pct"]:
+        alignment_score = "Media"
+    else:
+        alignment_score = "Baja"
+
+    return {
+        "n_sectors": n_sectors,
+        "sector_distribution": sector_distribution,
+        "max_sector": max_sector,
+        "warnings": warnings,
+        "alignment_score": alignment_score,
+        "unknown_tickers": unknown_tickers,
+    }
+
+
+def display_cycle_analysis(cycle_phase, sector_prefs, adjusted_prefs,
+                            candidate_universe, diversification, profile):
+    """
+    [NEW — CYCLE MODULE]
+    Muestra en consola el analisis completo de ciclo economico,
+    rotacion sectorial y universo candidato generado.
+    """
+    SEP = "─" * 65
+    phase_labels = {
+        "recuperacion": "Recuperacion",
+        "expansion": "Expansion",
+        "desaceleracion": "Desaceleracion",
+        "recesion": "Recesion",
+    }
+    phase_label = phase_labels.get(cycle_phase, cycle_phase)
+
+    print(f"\n  {SEP}")
+    print("  ANALISIS DE ROTACION SECTORIAL")
+    print(f"  {SEP}")
+    print(f"  Fase del ciclo      : {phase_label}")
+    print(f"  Perfil inversionista: {profile}")
+
+    # Sector preferences (base)
+    print(f"\n  Sectores favorecidos (por fase del ciclo):")
+    print(f"    ✅ Preferidos  : {', '.join(sector_prefs['preferred_sectors'])}")
+    print(f"    ➕ Secundarios : {', '.join(sector_prefs['secondary_sectors'])}")
+    print(f"    ⬇  Subponderar : {', '.join(sector_prefs['underweight_or_avoid'])}")
+
+    # Profile adjustment
+    print(f"\n  Ajuste por perfil ({profile}):")
+    print(f"    → {adjusted_prefs['adjustment_description']}")
+    if adjusted_prefs["adjusted_preferred"] != sector_prefs["preferred_sectors"]:
+        print(f"    → Preferidos ajustados: {', '.join(adjusted_prefs['adjusted_preferred'])}")
+    print(f"    → Min. defensivos: {adjusted_prefs['force_defensive_min_pct']}%")
+    print(f"    → Estilos preferidos: {', '.join(adjusted_prefs['style_preference'])}")
+
+    # Candidate universe
+    n_assets = len(candidate_universe["tickers"])
+    print(f"\n  {SEP}")
+    print(f"  UNIVERSO DE ACTIVOS SUGERIDO ({n_assets} activos)")
+    print(f"  {SEP}")
+
+    for sector, tickers in candidate_universe["sector_breakdown"].items():
+        n = len(tickers)
+        tickers_str = ", ".join(tickers)
+        singular = "activo" if n == 1 else "activos"
+        print(f"    {sector:<24}: {tickers_str:<35} ({n} {singular})")
+
+    # Diversification check
+    n_sectors = diversification["n_sectors"]
+    alignment = diversification["alignment_score"]
+    icon = "✅" if alignment in ("Alta", "Media") else "⚠"
+    print(f"\n  Diversificacion sectorial: {n_sectors} sectores representados {icon}")
+    print(f"  Puntuacion de alineacion: {alignment}")
+
+    if diversification["warnings"]:
+        print(f"\n  Advertencias:")
+        for w in diversification["warnings"]:
+            print(f"    ⚠ {w}")
+
+    print(f"  {SEP}")
+
+
+def build_economic_cycle_payload(cycle_phase, sector_prefs, adjusted_prefs,
+                                  candidate_universe, diversification, profile):
+    """
+    [NEW — CYCLE MODULE]
+    Construye la seccion 'economic_cycle' del results payload.
+    Retorna un dict JSON-serializable con toda la informacion del ciclo.
+    """
+    phase_labels = {
+        "recuperacion": "Recuperacion",
+        "expansion": "Expansion",
+        "desaceleracion": "Desaceleracion",
+        "recesion": "Recesion",
+    }
+
+    return {
+        "selected_phase": cycle_phase,
+        "phase_label": phase_labels.get(cycle_phase, cycle_phase),
+        "phase_description": sector_prefs["description"],
+        "preferred_sectors": sector_prefs["preferred_sectors"],
+        "secondary_sectors": sector_prefs["secondary_sectors"],
+        "underweight_sectors": sector_prefs["underweight_or_avoid"],
+        "profile_adjusted_preferences": {
+            "profile": profile,
+            "profile_group": adjusted_prefs["profile_group"],
+            "adjustment_applied": adjusted_prefs["adjustment_description"],
+            "final_preferred": adjusted_prefs["adjusted_preferred"],
+            "final_secondary": adjusted_prefs["adjusted_secondary"],
+            "force_defensive_min_pct": adjusted_prefs["force_defensive_min_pct"],
+            "style_preference": adjusted_prefs["style_preference"],
+        },
+        "candidate_universe": {
+            "tickers": candidate_universe["tickers"],
+            "n_assets": len(candidate_universe["tickers"]),
+            "n_sectors": candidate_universe["n_sectors"],
+            "strategy": candidate_universe["strategy_label"],
+            "sector_breakdown": {
+                sector: tickers
+                for sector, tickers in candidate_universe["sector_breakdown"].items()
+            },
+        },
+        "sector_diversification_summary": {
+            "n_sectors": diversification["n_sectors"],
+            "max_sector_weight": diversification["max_sector"],
+            "warnings": diversification["warnings"],
+            "alignment_score": diversification["alignment_score"],
+        },
+    }
+
+
+def run_guided_portfolio_builder(profile):
+    """
+    [NEW — CYCLE MODULE]
+    Flujo de construccion guiada de portafolio basado en ciclo economico.
+
+    Este flujo:
+      1. Pregunta la fase del ciclo economico
+      2. Calcula preferencias sectoriales
+      3. Ajusta por perfil del inversionista
+      4. Genera un universo candidato diversificado
+      5. Muestra los resultados al usuario
+      6. Permite al usuario aceptar, editar o rechazar
+
+    Retorna un dict con:
+      - tickers: list[str]             (tickers finales a usar)
+      - cycle_data: dict               (datos del ciclo para el payload)
+      - mode: str                      ("guided" o "manual" si rechazo)
+    """
+    # Step 1: Get cycle phase
+    cycle_phase = get_economic_cycle_phase()
+
+    # Step 2: Get sector preferences
+    sector_prefs = get_cycle_sector_preferences(cycle_phase)
+
+    # Step 3: Adjust by profile
+    adjusted_prefs = adjust_sector_preferences_by_profile(
+        profile, sector_prefs, cycle_phase
+    )
+
+    # Step 4: Generate candidate universe
+    candidate = generate_candidate_universe(
+        profile, cycle_phase, adjusted_prefs,
+        stocks_catalog=STOCKS_CATALOG, n_assets=16
+    )
+
+    # Step 5: Analyze diversification
+    diversification = analyze_sector_diversification(
+        candidate["tickers"], stocks_catalog=STOCKS_CATALOG
+    )
+
+    # Step 6: Display results
+    display_cycle_analysis(
+        cycle_phase, sector_prefs, adjusted_prefs,
+        candidate, diversification, profile
+    )
+
+    # Step 7: User decision
+    print(f"\n  Opciones:")
+    print(f"    1. Aceptar este universo")
+    print(f"    2. Editar (agregar/quitar tickers)")
+    print(f"    3. Rechazar y usar modo manual")
+    choice = prompt_int("\n  Tu eleccion (1-3): ", 1, 3)
+
+    final_tickers = list(candidate["tickers"])
+
+    if choice == 2:
+        # Edit mode
+        print(f"\n  {'─'*60}")
+        print(f"  EDICION DEL UNIVERSO CANDIDATO")
+        print(f"  {'─'*60}")
+        print(f"  Tickers actuales: {', '.join(final_tickers)}")
+
+        # Remove tickers
+        print(f"\n  Tickers a ELIMINAR (separados por coma, o Enter para ninguno):")
+        remove_raw = input("    Eliminar: ").strip().upper()
+        if remove_raw:
+            to_remove = [t.strip() for t in remove_raw.split(",") if t.strip()]
+            removed = []
+            for t in to_remove:
+                if t in final_tickers:
+                    final_tickers.remove(t)
+                    removed.append(t)
+            if removed:
+                print(f"    Eliminados: {', '.join(removed)}")
+
+        # Add tickers
+        print(f"\n  Tickers a AGREGAR (separados por coma, o Enter para ninguno):")
+        print(f"  (Puedes usar cualquier ticker de Yahoo Finance)")
+        add_raw = input("    Agregar: ").strip().upper()
+        if add_raw:
+            to_add = [t.strip() for t in add_raw.split(",") if t.strip()]
+            added = []
+            for t in to_add:
+                if t not in final_tickers:
+                    final_tickers.append(t)
+                    added.append(t)
+            if added:
+                print(f"    Agregados: {', '.join(added)}")
+
+        print(f"\n  Universo final ({len(final_tickers)} activos): {', '.join(final_tickers)}")
+
+        # Re-analyze diversification with edited universe
+        diversification = analyze_sector_diversification(
+            final_tickers, stocks_catalog=STOCKS_CATALOG
+        )
+        if diversification["warnings"]:
+            print(f"\n  Advertencias de diversificacion:")
+            for w in diversification["warnings"]:
+                print(f"    ⚠ {w}")
+
+    elif choice == 3:
+        # Reject — fall back to manual mode
+        print("\n  Modo guiado rechazado. Continuaras con el modo manual.")
+        # Still build payload with cycle data for reference
+        cycle_payload = build_economic_cycle_payload(
+            cycle_phase, sector_prefs, adjusted_prefs,
+            candidate, diversification, profile
+        )
+        return {
+            "tickers": None,
+            "cycle_data": cycle_payload,
+            "mode": "manual",
+        }
+
+    # Build the cycle payload
+    # Update candidate universe with final tickers
+    if choice == 2:
+        # Rebuild sector breakdown for edited list
+        ticker_to_sector = {s["ticker"]: s["sector"] for s in STOCKS_CATALOG}
+        new_breakdown = {}
+        for t in final_tickers:
+            sector = ticker_to_sector.get(t, "Otro")
+            if sector not in new_breakdown:
+                new_breakdown[sector] = []
+            new_breakdown[sector].append(t)
+        candidate["tickers"] = final_tickers
+        candidate["sector_breakdown"] = new_breakdown
+        candidate["n_sectors"] = len(new_breakdown)
+        candidate["strategy_label"] += " (editado por usuario)"
+
+    cycle_payload = build_economic_cycle_payload(
+        cycle_phase, sector_prefs, adjusted_prefs,
+        candidate, diversification, profile
+    )
+
+    return {
+        "tickers": final_tickers,
+        "cycle_data": cycle_payload,
+        "mode": "guided",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1146,44 +2030,63 @@ def recommend_fixed_income_mix(profile, horizon_cat, pct_fixed, monto_total):
 # SECTION 6 — INVESTMENT CONFIGURATION (tickers, dates, benchmark)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def configure_investment(profile):
+def configure_investment(profile, preset_tickers=None):
     """
+    [MODIFIED — CYCLE MODULE]
     Collect investment configuration inputs, organized in 3 logical blocks:
-      Block A — Assets (tickers + benchmark)
+      Block A — Assets (tickers + benchmark)  [SKIPPED if preset_tickers provided]
       Block B — Market Parameters (periodicity, dates, risk-free rate)
       Block C — Investment Parameters (amount, target return)
+
+    preset_tickers: list[str] or None. If provided (from guided mode),
+                    Block A is skipped and these tickers are used directly.
     """
     print("\n" + "=" * 65)
     print("  CONFIGURACION DE LA INVERSION")
     print("=" * 65)
 
     # ── BLOQUE A: Activos ────────────────────────────────────────────────
-    print(f"\n  {'─'*60}")
-    print("  BLOQUE A — SELECCION DE ACTIVOS")
-    print(f"  {'─'*60}")
+    if preset_tickers is not None:
+        # [NEW — CYCLE MODULE] Tickers pre-loaded from guided mode
+        tickers = list(preset_tickers)
+        print(f"\n  {'─'*60}")
+        print("  BLOQUE A — ACTIVOS (pre-seleccionados por modo guiado)")
+        print(f"  {'─'*60}")
+        print(f"  Tickers seleccionados ({len(tickers)}): {', '.join(tickers)}")
 
-    print(f"\n  [1/7] NUMERO DE ACTIVOS (max {MAX_TICKERS})")
-    num_tickers = prompt_int(f"  Cuantos tickers deseas analizar? (1-{MAX_TICKERS}): ", 1, MAX_TICKERS)
+        print(f"\n  BENCHMARK (indice de referencia)")
+        print(f"  Sugeridos: SPY, ^GSPC, ^DJI, ^IXIC, QQQ")
+        print(f"  Presiona Enter para usar ({DEFAULT_BENCHMARK}).\n")
+        bench_raw = input("  Benchmark ticker: ").strip().upper()
+        benchmark = bench_raw if bench_raw else DEFAULT_BENCHMARK
+    else:
+        # Original manual ticker entry
+        print(f"\n  {'─'*60}")
+        print("  BLOQUE A — SELECCION DE ACTIVOS")
+        print(f"  {'─'*60}")
 
-    print(f"\n  [2/7] TICKERS (simbolos de Yahoo Finance)")
-    print("  Ingresa los tickers uno por uno (ej. AAPL, MSFT, AMZN):\n")
-    tickers = []
-    for i in range(num_tickers):
-        while True:
-            ticker = input(f"    Ticker {i+1}/{num_tickers}: ").strip().upper()
-            if not ticker:
-                print("    [X] El ticker no puede estar vacio.")
-            elif ticker in tickers:
-                print("    [X] Ticker duplicado.")
-            else:
-                tickers.append(ticker)
-                break
+        print(f"\n  [1/7] NUMERO DE ACTIVOS (max {MAX_TICKERS})")
+        num_tickers = prompt_int(f"  Cuantos tickers deseas analizar? (1-{MAX_TICKERS}): ", 1, MAX_TICKERS)
 
-    print(f"\n  [3/7] BENCHMARK (indice de referencia)")
-    print(f"  Sugeridos: SPY, ^GSPC, ^DJI, ^IXIC, QQQ")
-    print(f"  Presiona Enter para usar ({DEFAULT_BENCHMARK}).\n")
-    bench_raw = input("  Benchmark ticker: ").strip().upper()
-    benchmark = bench_raw if bench_raw else DEFAULT_BENCHMARK
+        print(f"\n  [2/7] TICKERS (simbolos de Yahoo Finance)")
+        print("  Ingresa los tickers uno por uno (ej. AAPL, MSFT, AMZN):\n")
+        tickers = []
+        for i in range(num_tickers):
+            while True:
+                ticker = input(f"    Ticker {i+1}/{num_tickers}: ").strip().upper()
+                if not ticker:
+                    print("    [X] El ticker no puede estar vacio.")
+                elif ticker in tickers:
+                    print("    [X] Ticker duplicado.")
+                else:
+                    tickers.append(ticker)
+                    break
+
+        print(f"\n  [3/7] BENCHMARK (indice de referencia)")
+        print(f"  Sugeridos: SPY, ^GSPC, ^DJI, ^IXIC, QQQ")
+        print(f"  Presiona Enter para usar ({DEFAULT_BENCHMARK}).\n")
+        bench_raw = input("  Benchmark ticker: ").strip().upper()
+        benchmark = bench_raw if bench_raw else DEFAULT_BENCHMARK
 
     # ── BLOQUE B: Parametros de Mercado ──────────────────────────────────
     print(f"\n  {'─'*60}")
@@ -4318,6 +5221,38 @@ def generate_recommendation_report(cfg, valid_tickers, corr_matrix,
             print(f"    [{c['severity']}] {c['message'][:80]}..."
                   if len(c['message']) > 80 else f"    [{c['severity']}] {c['message']}")
 
+    # [NEW — CYCLE MODULE] Economic cycle context in memo
+    cycle_data = cfg.get("economic_cycle")
+    if cycle_data:
+        print(f"\n  1B. CONTEXTO DE CICLO ECONOMICO")
+        print(f"  {'─'*40}")
+        print(f"  Fase seleccionada     : {cycle_data.get('phase_label', 'N/A')}")
+        print(f"  {cycle_data.get('phase_description', '')}")
+        pref_adj = cycle_data.get("profile_adjusted_preferences", {})
+        print(f"\n  Preferencias ajustadas por perfil ({pref_adj.get('profile', 'N/A')}):")
+        print(f"    Ajuste aplicado: {pref_adj.get('adjustment_applied', 'N/A')}")
+        final_pref = pref_adj.get("final_preferred", [])
+        final_sec = pref_adj.get("final_secondary", [])
+        if final_pref:
+            print(f"    Sectores preferidos : {', '.join(final_pref)}")
+        if final_sec:
+            print(f"    Sectores secundarios: {', '.join(final_sec)}")
+        underweight = cycle_data.get("underweight_sectors", [])
+        if underweight:
+            print(f"    Subponderar         : {', '.join(underweight)}")
+        # Universe strategy
+        univ = cycle_data.get("candidate_universe", {})
+        if univ:
+            print(f"\n  Universo candidato: {univ.get('n_assets', 0)} activos en "
+                  f"{univ.get('n_sectors', 0)} sectores")
+            print(f"  Estrategia: {univ.get('strategy', 'N/A')}")
+        # Diversification summary
+        div_sum = cycle_data.get("sector_diversification_summary", {})
+        if div_sum:
+            print(f"  Alineacion sectorial  : {div_sum.get('alignment_score', 'N/A')}")
+            for w in div_sum.get("warnings", []):
+                print(f"    ⚠ {w}")
+
     # 2. Asset Allocation Overview
     print(f"\n  2. ASIGNACION DE ACTIVOS")
     print(f"  {'─'*40}")
@@ -5063,27 +5998,31 @@ def show_welcome_screen():
 
 def show_main_menu():
     """
+    [MODIFIED — CYCLE MODULE]
     Display the top-level main menu (shown ONCE per session).
-    Returns the user's choice: 'analysis', 'education', or 'exit'.
+    Returns the user's choice: 'analysis', 'guided', 'education', or 'exit'.
     """
     while True:
         print(f"\n{'=' * 65}")
         print("  MENU PRINCIPAL")
         print(f"{'=' * 65}")
         print("""
-    1. Iniciar analisis de portafolio
-    2. Explorar conceptos financieros y ejemplos
-    3. Salir
+    1. Iniciar analisis de portafolio (modo manual)
+    2. Construccion guiada de portafolio (ciclo economico)
+    3. Explorar conceptos financieros y ejemplos
+    4. Salir
 """)
-        choice = input("  Tu eleccion (1/2/3): ").strip()
+        choice = input("  Tu eleccion (1/2/3/4): ").strip()
         if choice == "1":
             return "analysis"
         elif choice == "2":
-            return "education"
+            return "guided"
         elif choice == "3":
+            return "education"
+        elif choice == "4":
             return "exit"
         else:
-            print("  [X] Opcion invalida. Elige 1, 2 o 3.")
+            print("  [X] Opcion invalida. Elige 1, 2, 3 o 4.")
 
 
 def run_education_module():
@@ -5260,13 +6199,25 @@ def _wrap_text(text, width=55, indent=5):
 
 
 def show_summary(cfg):
-    """Display ALL configuration inputs on a single screen."""
+    """[MODIFIED — CYCLE MODULE] Display ALL configuration inputs on a single screen."""
     S = "=" * 65
     print(f"\n{S}")
     print("  RESUMEN DE CONFIGURACION")
     print(S)
     print(f"  Perfil            : {cfg['profile']}")
     print(f"  Horizonte         : {cfg['horizon_years']} anos ({cfg['horizon_category']})")
+
+    # [NEW — CYCLE MODULE] Show cycle context if available
+    cycle_data = cfg.get("economic_cycle")
+    if cycle_data:
+        phase_label = cycle_data.get("phase_label", "N/A")
+        strategy = cycle_data.get("candidate_universe", {}).get("strategy", "N/A")
+        preferred = cycle_data.get("preferred_sectors", [])
+        print(f"  Ciclo economico   : {phase_label}")
+        print(f"  Estrategia        : {strategy}")
+        if preferred:
+            print(f"  Sectores favorec. : {', '.join(preferred[:4])}")
+
     print(f"  Renta Fija        : {cfg['pct_fixed']:.0f} %")
     print(f"  Renta Variable    : {cfg['pct_variable']:.0f} %")
     print(f"  Tickers           : {', '.join(cfg['tickers'])}")
@@ -5712,10 +6663,11 @@ def handle_final_actions(cfg, analysis):
 
 def main():
     """
+    [MODIFIED — CYCLE MODULE]
     Main program flow — designed as a guided financial advisor:
-      1. Welcome → 2. Menu → 3. (Education) → 4. Questionnaire →
-      5. Profile → 6. Config → 7. Summary → 8. Analysis → 9. Results →
-      10. Recommendation → 11. Final options
+      1. Welcome → 2. Menu → 3. (Education / Guided) → 4. Questionnaire →
+      5. Profile → 6. (Cycle Module if guided) → 7. Config →
+      8. Summary → 9. Analysis → 10. Results → 11. Final options
     """
 
     # Phase 1: Welcome
@@ -5734,6 +6686,9 @@ def main():
             run_education_module()
             continue
 
+        # ── Both "analysis" (manual) and "guided" share the questionnaire ──
+        is_guided_mode = (menu_choice == "guided")
+
         # Phase 3: Investor Questionnaire
         answers = get_investor_questionnaire()
         profile = determine_investor_profile(answers)
@@ -5744,8 +6699,25 @@ def main():
             profile, answers
         )
 
+        # ── [NEW — CYCLE MODULE] Phase 4B: Guided Portfolio Builder ──────
+        preset_tickers = None
+        cycle_payload = None
+
+        if is_guided_mode:
+            guided_result = run_guided_portfolio_builder(profile)
+
+            if guided_result["mode"] == "guided":
+                # User accepted the guided universe
+                preset_tickers = guided_result["tickers"]
+                cycle_payload = guided_result["cycle_data"]
+            elif guided_result["mode"] == "manual":
+                # User rejected guided mode, fall back to manual
+                cycle_payload = guided_result["cycle_data"]  # keep cycle data for reference
+                print("\n  Continuando con el modo manual de seleccion de activos...")
+            # In both cases, cycle_payload is stored for the report
+
         # Phase 5: Investment Configuration
-        market_cfg = configure_investment(profile)
+        market_cfg = configure_investment(profile, preset_tickers=preset_tickers)
 
         # Build unified config dict
         cfg = {
@@ -5759,6 +6731,10 @@ def main():
             "experience_label": answers.get("experience_label", "N/A"),
             "volatility_comfort": answers.get("volatility_comfort", "N/A"),
         }
+
+        # ── [NEW — CYCLE MODULE] Store cycle data in cfg if available ────
+        if cycle_payload:
+            cfg["economic_cycle"] = cycle_payload
 
         # ── [NEW — PHASE 1] Store pillar profiling data if available ─────
         if "pillar_tolerance_level" in answers:

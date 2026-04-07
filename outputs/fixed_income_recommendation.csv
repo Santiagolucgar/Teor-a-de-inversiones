@@ -1,8 +1,8 @@
 Instrumento,Peso (%),Monto ($)
-Efectivo / Mercado de dinero,10.0,10000.0
-Deuda gubernamental corto plazo,15.0,15000.0
-Bonos gubernamentales plazo intermedio,25.0,25000.0
-Bonos gubernamentales largo plazo,10.0,10000.0
-Deuda corporativa grado de inversion,15.0,15000.0
-Valores protegidos contra inflacion,10.0,10000.0
-Fondos de deuda / bonos,15.0,15000.0
+Efectivo / Mercado de dinero,5.0,20000.0
+Deuda gubernamental corto plazo,5.0,20000.0
+Bonos gubernamentales plazo intermedio,20.0,80000.0
+Bonos gubernamentales largo plazo,20.0,80000.0
+Deuda corporativa grado de inversion,20.0,80000.0
+Valores protegidos contra inflacion,15.0,60000.0
+Fondos de deuda / bonos,15.0,60000.0
